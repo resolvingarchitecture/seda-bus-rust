@@ -1,29 +1,18 @@
 [package]
 name = "seda_bus"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["Brian Taylor <brian@resolvingarchitecture.io>"]
-license-file = "LICENSE"
-edition = "2018"
-description = "A Staged Event-Driven Architectural message bus"
+license = "MIT"
+edition = "2021"
+description = "A small, broker-less, staged (SEDA-style) message bus"
 homepage = "https://resolvingarchitecture.io"
-documentation = "https://github.com/resolvingarchitecture/seda-bus"
-repository = "https://github.com/resolvingarchitecture/seda-bus.git"
-publish = true
+documentation = "https://docs.rs/seda_bus"
+repository = "https://github.com/resolvingarchitecture/seda-bus"
 readme = "README.md"
-keywords = ["seda","seda-bus","message-bus"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+keywords = ["seda", "message-bus", "staged", "concurrency"]
+categories = ["concurrency"]
 
 [dependencies]
-log = "0.4.8"
-simple_logger = "1.6.0"
-rand = "0.7.3"
-clap = "2.33.0"
-
-#dbus = "0.8.1"
-#scheduled-thread-pool = "0.2.3"
-
-ra_common = "0.1.3"
+log = "0.4"
 
 [dev-dependencies]
-assert_cmd = "0.10"

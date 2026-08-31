@@ -1,113 +1,81 @@
 <div align="center">
-  <img src="https://resolvingarchitecture.io/images/ra.png"  />
-
-  <h1>Resolving Architecture</h1>
-
-  <p>
-    <strong>Clarity in Design</strong>
-  </p>
-  
-  <h2>SEDA Bus</h2>
-  
-  <p>
-   Staged Event-Driven Architecture Bus - A form of message bus avoiding the high overhead of thread-based concurrency models where channels get their own inbound and outbound queues. 
-  </p>
-  
-  <p>
-    <a href="https://travis-ci.com/resolvingarchitecture/seda-bus"><img alt="build" src="https://img.shields.io/travis/resolvingarchitecture/seda-bus"/></a>
-    <a href="https://crates.io/crates/seda-bus"><img alt="Crate Info" src="https://img.shields.io/crates/v/seda-bus.svg"/></a>
-    <a href="https://docs.rs/crate/seda-bus/"><img alt="API Docs" src="https://img.shields.io/badge/docs.seda-bus-green"/></a>
-  </p>
-  <p>
-    <a href="https://github.com/resolvingarchitecture/seda-bus/blob/master/LICENSE"><img alt="License" src="https://img.shields.io/github/license/resolvingarchitecture/seda-bus"/></a>
-    <a href="https://resolvingarchitecture.io/ks/publickey.brian@resolvingarchitecture.io.asc"><img alt="PGP" src="https://img.shields.io/keybase/pgp/objectorange"/></a>
-  </p>
-  <p>
-    <img alt="commits" src="https://img.shields.io/crates/d/seda-bus"/>
-    <img alt="repo size" src="https://img.shields.io/github/repo-size/resolvingarchitecture/seda-bus"/>
-  </p>
-  <p>
-    <img alt="num lang" src="https://img.shields.io/github/languages/count/resolvingarchitecture/seda-bus"/>
-    <img alt="top lang" src="https://img.shields.io/github/languages/top/resolvingarchitecture/seda-bus"/>
-    <a href="https://blog.rust-lang.org/2020/03/12/Rust-1.42.html"><img alt="Rustc Version 1.42+" src="https://img.shields.io/badge/rustc-1.42+-green.svg"/></a>
-  </p>
-
-  <h4>
-    <a href="https://resolvingarchitecture.io">Info</a>
-    <span> | </span>
-    <a href="https://docs.rs/crate/seda-bus/">Docs</a>
-    <span> | </span>
-    <a href="https://github.com/resolvingarchitecture/seda-bus/blob/master/CHANGELOG.md">Changelog</a>
-  </h4>
+  <h1>seda-bus</h1>
+  <p><strong>Resolving Architecture &mdash; Clarity in Design</strong></p>
+  <p>A small, broker-less, <strong>staged</strong> message bus for Rust.</p>
 </div>
 
-## Donate
-Request BTC address for a donation at brian@resolvingarchitecture.io.
+Work is decomposed into stages (`Channel`s) connected by bounded queues. One
+shared thread pool drains every stage; each stage has its own concurrency limit
+so none can monopolise the pool. There is no broker and no external
+dependency beyond `log`.
 
-## Notes
-!! WIP - not stable until version 1.0 !!
+```rust
+use seda_bus::{Bus, ChannelConfig, Delivery, Envelope};
+use std::sync::mpsc::channel;
+use std::time::Duration;
 
-## Roadmap 
+let bus = Bus::new(4); // 4 shared worker threads
 
-*[ ] 1.0.0 - Minimal Stable Useful Functionality
-    *[x] 0.1.0 - send/receive non-persistent messages between two channels
-    *[x] 0.2.0 - provide CLI
-    *[ ] 0.3.0 - provide optional guaranteed delivery at the message level
-*[ ] 2.0.0 - use [dbus](https://en.wikipedia.org/wiki/D-Bus) for inter-process communications on Linux
-*[ ] 3.0.0 - use [ipcd](https://dev.to/legolord208/programming-for-redox-os-4124) for inter-process communications on RedoxOS
+bus.channel("ingest",    ChannelConfig::default().capacity(1000));
+bus.channel("transform", ChannelConfig::default().capacity(1000).concurrency(4));
+bus.channel("sink",      ChannelConfig::default().capacity(1000));
 
-[Crates.io](https://crates.io/crates/seda_bus)
+bus.subscribe("ingest",    |_e: &mut Envelope| true);
+bus.subscribe("transform", |e: &mut Envelope| { e.payload.make_ascii_uppercase(); true });
 
-## Background
-Staged Event-Driven Architecture (SEDA) is an approach to software architecture that decomposes a complex,
-event-driven application into a set of stages connected by queues. It avoids the high overhead associated
-with thread-based concurrency models (i.e. locking, unlocking, and polling for locks), and decouples event
-and thread scheduling from application logic. By performing admission control on each event queue, the
-service can be well-conditioned to load, preventing resources from being over-committed when demand exceeds
-service capacity.
+let (tx, rx) = channel();
+bus.subscribe("sink", move |e: &mut Envelope| tx.send(e.payload.clone()).is_ok());
 
-SEDA employs dynamic control to automatically tune runtime parameters (such as the scheduling parameters of
-each stage) as well as to manage load (like performing adaptive load shedding). Decomposing services into a
-set of stages also enables modularity and code reuse, as well as the development of debugging tools for
-complex event-driven applications.
+bus.publish(
+    Envelope::new("ingest", b"hello".to_vec()).with_slip(["transform", "sink"]),
+    Some(Duration::from_secs(1)),
+);
+assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"HELLO");
+bus.shutdown(Duration::from_secs(5));
+```
 
-A Bus type architectural router style is decentralized in nature such that each instance of a node can be used
-with other bus nodes, messages need to go through any specific node as in more centralized routers like
-hub-and-spoke type routers. This is accomplished by supporting publishers and consumers using their own addressing
-schemes creating their own mappings through chosen message channels, e.g. one message channel could be associated
-with a persistence type service while another with a network type service - the bus cares not which is called
-they're all just endpoints.
+## Features
 
-Bringing together SEDA and Bus architectural patterns is what this component attempts.
+| | |
+|---|---|
+| **Bounded stages** | each channel has a capacity &mdash; admission control |
+| **Back-pressure policy** | `Block` / `Reject` / `DropNewest` / `DropOldest` per stage |
+| **Per-stage concurrency** | how many envelopes a stage may process at once |
+| **Delivery** | `PointToPoint` (round-robin) or `PubSub` (fan-out) |
+| **Routing slips** | an envelope carries an itinerary of stages to visit |
+| **Retry + dead-letter** | nacked envelopes retry up to `max_attempts`, then route to a DLQ |
+| **Metrics** | per-stage enqueued / delivered / nacked / dropped / dead-lettered / depth |
+| **Graceful shutdown** | stop accepting, drain within a timeout, then join the pool |
 
-This component is also implemented in [Java](https://github.com/resolvingarchitecture/seda-bus-java) and [Typescript](https://github.com/resolvingarchitecture/seda-bus-ts).
-This project is meant to support the design of the Java SEDA Bus in an implementation closer to the Linux/Redox Operating System
-for embedded projects. It may eventually support integration with each operating system's own messaging bus.
+## What this is not
 
-## Setup - Ubuntu 18.04
-1. Install Rust
-   ```shell script
-   sudo apt update
-   sudo apt upgrade
-   curl https://sh.rustup.rs -sSf | sh
-   ```
-2. Restart terminal
-3. Verify Rust installed
-    ```shell script
-     rustc --version
-    ```
-4. Install build essentials
-    ```shell script
-    sudo apt install build-essential
-    ```
-5. install crate
-    ```shell script
-    cargo install seda_bus
-    ```
-6. 
+SEDA's original design also included a **controller** that watched per-stage
+latency and queue depth at runtime and re-tuned thread allocation and shed load
+automatically. That adaptive controller is not implemented here &mdash; every
+setting is static configuration. It is the interesting next step (`2.0`), and
+the reason the model is worth revisiting. Matt Welsh (SEDA's author) later
+argued the strict per-stage-queue-and-pool split was usually a mistake; this
+bus already uses one shared pool, in line with that retrospective.
+
+## Companion implementations
+
+Same design, other languages:
+
+* [seda-bus-java](https://github.com/resolvingarchitecture/seda-bus-java) &mdash; the original, with optional guaranteed-delivery persistence
+* [seda-bus-python](https://github.com/resolvingarchitecture/seda-bus-python) &mdash; built to exercise free-threaded (PEP 703) CPython
 
 ## Development
 
-### Links
-* https://github.com/diwic/dbus-rs
-* https://crates.io/crates/dbus
+```sh
+cargo test
+cargo run --example pipeline
+```
+
+## Status
+
+`0.3.0` &mdash; working core, tested. Not stable until `1.0`.
+
+## Reference
+
+Welsh, Culler, Brewer. *SEDA: An Architecture for Well-Conditioned, Scalable
+Internet Services.* SOSP 2001.

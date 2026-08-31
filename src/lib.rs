@@ -1,70 +1,35 @@
-use std::sync::mpsc::{channel, Sender, Receiver};
-use std::collections::HashMap;
-use std::time::Duration;
-use ra_common::models::Envelope;
+//! A small, broker-less, **staged** message bus.
+//!
+//! Work is decomposed into stages ([`Bus::channel`]) connected by bounded
+//! queues. One shared thread pool drains every stage; each stage has its own
+//! concurrency limit so none can monopolise the pool.
+//!
+//! ```
+//! use seda_bus::{Bus, ChannelConfig, Delivery, Envelope};
+//! use std::sync::mpsc::channel;
+//! use std::time::Duration;
+//!
+//! let bus = Bus::new(4);
+//! bus.channel("upper", ChannelConfig::default().capacity(64));
+//! let (tx, rx) = channel();
+//! bus.subscribe("upper", move |e: &mut Envelope| {
+//!     e.payload.make_ascii_uppercase();
+//!     tx.send(e.payload.clone()).is_ok()
+//! });
+//!
+//! bus.publish(Envelope::new("upper", b"hello".to_vec()), Some(Duration::from_secs(1)));
+//! assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"HELLO");
+//! bus.shutdown(Duration::from_secs(2));
+//! ```
+//!
+//! What this is *not*: SEDA's original design also included a controller that
+//! watched per-stage latency and queue depth at runtime and re-tuned thread
+//! allocation and shed load automatically. That adaptive controller is future
+//! work. This is the static-configuration core it builds on.
 
-pub struct MessageChannel {
-    pub addr: u8,
-    pub tx: Sender<Envelope>,
-    pub rx: Receiver<Envelope>
-}
+mod bus;
+mod envelope;
+mod pool;
 
-impl MessageChannel {
-    pub fn new(addr: u8) -> MessageChannel {
-        let (tx, rx) = channel();
-        MessageChannel { addr, tx, rx }
-    }
-}
-
-pub struct MessageBus {
-    name: String,
-    channels: HashMap<u8,MessageChannel>
-}
-
-impl MessageBus {
-    pub fn new(name: String) -> MessageBus {
-        MessageBus { name, channels: HashMap::new() }
-    }
-
-    pub fn register(&mut self) -> u8 {
-        let id :u8 = self.channels.len() as u8;
-        self.channels.insert(id, MessageChannel::new(id));
-        id
-    }
-    pub fn unregister(&mut self, id: u8) -> bool {
-        self.channels.remove(&id).is_some()
-    }
-    pub fn send(&mut self, env: Envelope) -> bool {
-        match self.channels.get(&env.to) {
-            Some(ch) => {
-                match ch.tx.send(env) {
-                    Ok(()) => true,
-                    Err(_) => false
-                }
-            },
-            None => false
-        }
-    }
-    pub fn poll(&mut self, addr: u8) -> Option<Envelope> {
-        match self.channels.get(&addr) {
-            Some(ch) => {
-                match ch.rx.try_recv() {
-                    Ok(env) => Option::Some(env),
-                    Err(_) => Option::None
-                }
-            },
-            None => Option::None
-        }
-    }
-    pub fn poll_wait(&mut self, addr: u8, wait: u64) -> Option<Envelope> {
-        match self.channels.get(&addr) {
-            Some(ch) => {
-                match ch.rx.recv_timeout(Duration::from_millis(wait)) {
-                    Ok(env) => Option::Some(env),
-                    Err(_) => Option::None
-                }
-            },
-            None => Option::None
-        }
-    }
-}
+pub use bus::{Backpressure, Bus, ChannelConfig, Consumer, Delivery, Stats};
+pub use envelope::Envelope;
