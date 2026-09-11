@@ -6,11 +6,15 @@
 
 Work is decomposed into stages (`Channel`s) connected by bounded queues. One
 shared thread pool drains every stage; each stage has its own concurrency limit
-so none can monopolise the pool. There is no broker and no external
-dependency beyond `log`.
+so none can monopolise the pool. There is no broker. The envelope is
+[`ra-common`](https://github.com/resolvingarchitecture/ra-common-rust)'s —
+the same wrapper every other `seda-bus` port carries — so a document,
+routing slip, and headers all come from one shared type instead of a
+bus-specific one.
 
 ```rust
-use seda_bus::{Bus, ChannelConfig, Delivery, Envelope};
+use ra_common::serde_json::Value;
+use seda_bus::{envelope_payload, make_envelope, set_payload, Bus, ChannelConfig, Delivery, Envelope};
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
@@ -21,16 +25,22 @@ bus.channel("transform", ChannelConfig::default().capacity(1000).concurrency(4))
 bus.channel("sink",      ChannelConfig::default().capacity(1000));
 
 bus.subscribe("ingest",    |_e: &mut Envelope| true);
-bus.subscribe("transform", |e: &mut Envelope| { e.payload.make_ascii_uppercase(); true });
+bus.subscribe("transform", |e: &mut Envelope| {
+    let s = envelope_payload(e).and_then(Value::as_str).unwrap_or("").to_uppercase();
+    set_payload(e, Value::String(s));
+    true
+});
 
 let (tx, rx) = channel();
-bus.subscribe("sink", move |e: &mut Envelope| tx.send(e.payload.clone()).is_ok());
+bus.subscribe("sink", move |e: &mut Envelope| {
+    tx.send(envelope_payload(e).and_then(Value::as_str).unwrap_or("").to_string()).is_ok()
+});
 
 bus.publish(
-    Envelope::new("ingest", b"hello".to_vec()).with_slip(["transform", "sink"]),
+    make_envelope("ingest", Some(Value::String("hello".into())), ["transform".to_string(), "sink".to_string()]),
     Some(Duration::from_secs(1)),
 );
-assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"HELLO");
+assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "HELLO");
 bus.shutdown(Duration::from_secs(5));
 ```
 
@@ -74,7 +84,7 @@ cargo run --example pipeline
 
 ## Status
 
-`0.3.0` &mdash; working core, tested. Not stable until `1.0`.
+`0.4.0` &mdash; working core, tested. Not stable until `1.0`.
 
 ## Reference
 

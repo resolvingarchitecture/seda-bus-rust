@@ -1,79 +1,49 @@
-//! The unit of work that moves through the bus.
+//! The bus carries [`ra_common::Envelope`] — the same wrapper every other
+//! `seda-bus` port carries via its own `ra-common` port. Routing is driven by
+//! the envelope's `DynamicRoutingSlip`: each hop targets `route().service()`;
+//! the slip is walked one hop at a time with `Envelope::ratchet()`.
+//!
+//! These helpers keep the ergonomic `to` / `payload` / `slip` shape the other
+//! ports use on top of the richer `ra_common` type.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use ra_common::serde_json::Value;
+pub use ra_common::Envelope;
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
+/// seda-bus routes by service, not operation; `ra_common` still wants a value
+/// there.
+const OP: &str = "RECEIVE";
 
-fn next_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{nanos:x}-{seq:x}")
+/// Build a document envelope addressed to `to`, then visiting each name in
+/// `slip` in order.
+pub fn make_envelope(
+    to: impl Into<String>,
+    payload: Option<Value>,
+    slip: impl IntoIterator<Item = String>,
+) -> Envelope {
+    let mut env = Envelope::document();
+    // ra-common slips are LIFO: push the itinerary tail-first, then `to`
+    // last, so route()/ratchet() yields `to`, then slip[0], slip[1], ...
+    let hops: Vec<String> = slip.into_iter().collect();
+    for hop in hops.into_iter().rev() {
+        env.add_route(hop, OP);
+    }
+    env.add_route(to.into(), OP);
+    if let Some(p) = payload {
+        env.add_content(p);
+    }
+    env
 }
 
-/// A message addressed to a channel.
-///
-/// `to` is the channel the envelope is currently headed for. `slip` is an
-/// ordered list of channels to visit after the current one (a routing slip).
-/// `attempts` counts delivery attempts on the current hop.
-#[derive(Debug, Clone)]
-pub struct Envelope {
-    pub id: String,
-    pub to: String,
-    pub sender: Option<String>,
-    pub headers: HashMap<String, String>,
-    pub payload: Vec<u8>,
-    pub slip: VecDeque<String>,
-    pub attempts: u32,
+/// The channel name the envelope is currently headed for.
+pub fn target_service(env: &mut Envelope) -> Option<String> {
+    env.route().and_then(|r| r.service()).map(str::to_string)
 }
 
-impl Envelope {
-    pub fn new(to: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
-        Envelope {
-            id: next_id(),
-            to: to.into(),
-            sender: None,
-            headers: HashMap::new(),
-            payload: payload.into(),
-            slip: VecDeque::new(),
-            attempts: 0,
-        }
-    }
+/// The document `CONTENT` value (what [`make_envelope`] stored).
+pub fn envelope_payload(env: &Envelope) -> Option<&Value> {
+    env.content()
+}
 
-    /// Set the routing slip (channels to visit after the first one).
-    pub fn with_slip<I, S>(mut self, hops: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.slip = hops.into_iter().map(Into::into).collect();
-        self
-    }
-
-    pub fn with_sender(mut self, sender: impl Into<String>) -> Self {
-        self.sender = Some(sender.into());
-        self
-    }
-
-    pub fn with_header(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
-        self.headers.insert(key.into(), val.into());
-        self
-    }
-
-    /// Advance to the next hop in the routing slip. Returns `true` if there was
-    /// one (`to` now points at it, `attempts` reset), `false` if complete.
-    pub fn advance(&mut self) -> bool {
-        match self.slip.pop_front() {
-            Some(next) => {
-                self.to = next;
-                self.attempts = 0;
-                true
-            }
-            None => false,
-        }
-    }
+pub fn set_payload(env: &mut Envelope, payload: Value) {
+    env.add_content(payload);
 }

@@ -5,7 +5,8 @@
 //! concurrency limit so none can monopolise the pool.
 //!
 //! ```
-//! use seda_bus::{Bus, ChannelConfig, Delivery, Envelope};
+//! use seda_bus::{make_envelope, envelope_payload, Bus, ChannelConfig, Delivery, Envelope};
+//! use ra_common::serde_json::Value;
 //! use std::sync::mpsc::channel;
 //! use std::time::Duration;
 //!
@@ -13,12 +14,12 @@
 //! bus.channel("upper", ChannelConfig::default().capacity(64));
 //! let (tx, rx) = channel();
 //! bus.subscribe("upper", move |e: &mut Envelope| {
-//!     e.payload.make_ascii_uppercase();
-//!     tx.send(e.payload.clone()).is_ok()
+//!     let s = envelope_payload(e).and_then(Value::as_str).unwrap_or("").to_uppercase();
+//!     tx.send(s).is_ok()
 //! });
 //!
-//! bus.publish(Envelope::new("upper", b"hello".to_vec()), Some(Duration::from_secs(1)));
-//! assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"HELLO");
+//! bus.publish(make_envelope("upper", Some(Value::String("hello".into())), []), Some(Duration::from_secs(1)));
+//! assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "HELLO");
 //! bus.shutdown(Duration::from_secs(2));
 //! ```
 //!
@@ -32,4 +33,6 @@ mod envelope;
 mod pool;
 
 pub use bus::{Backpressure, Bus, ChannelConfig, Consumer, Delivery, Stats};
-pub use envelope::Envelope;
+pub use envelope::{envelope_payload, make_envelope, set_payload, target_service, Envelope};
+
+pub use ra_common;

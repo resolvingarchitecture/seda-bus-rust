@@ -7,7 +7,8 @@
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-use seda_bus::{Bus, ChannelConfig, Envelope};
+use ra_common::serde_json::Value;
+use seda_bus::{envelope_payload, make_envelope, set_payload, Bus, ChannelConfig, Envelope};
 
 fn main() {
     let bus = Bus::new(4);
@@ -20,23 +21,28 @@ fn main() {
     bus.channel("sink", ChannelConfig::default().capacity(100));
 
     bus.subscribe("ingest", |e: &mut Envelope| {
-        e.headers.insert("seen_by".into(), "ingest".into());
+        e.set_header("seen_by", Value::String("ingest".into()));
         true
     });
     bus.subscribe("transform", |e: &mut Envelope| {
-        e.payload.make_ascii_uppercase();
+        let s = envelope_payload(e).and_then(Value::as_str).unwrap_or("").to_uppercase();
+        set_payload(e, Value::String(s));
         true
     });
 
     let (tx, rx) = channel();
     bus.subscribe("sink", move |e: &mut Envelope| {
-        tx.send(String::from_utf8_lossy(&e.payload).into_owned())
-            .is_ok()
+        let s = envelope_payload(e).and_then(Value::as_str).unwrap_or("").to_string();
+        tx.send(s).is_ok()
     });
 
     for word in ["alpha", "bravo", "charlie", "delta", "echo"] {
         bus.publish(
-            Envelope::new("ingest", word.as_bytes().to_vec()).with_slip(["transform", "sink"]),
+            make_envelope(
+                "ingest",
+                Some(Value::String(word.to_string())),
+                ["transform".to_string(), "sink".to_string()],
+            ),
             Some(Duration::from_secs(1)),
         );
     }

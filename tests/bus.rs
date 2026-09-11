@@ -3,10 +3,19 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use seda_bus::{Backpressure, Bus, ChannelConfig, Consumer, Delivery, Envelope};
+use ra_common::serde_json::Value;
+use seda_bus::{make_envelope, envelope_payload, Backpressure, Bus, ChannelConfig, Consumer, Delivery, Envelope};
 
 fn cfg() -> ChannelConfig {
     ChannelConfig::default()
+}
+
+fn env(to: &str, n: u32) -> Envelope {
+    make_envelope(to, Some(Value::from(n)), [])
+}
+
+fn payload_u32(e: &Envelope) -> u32 {
+    envelope_payload(e).and_then(Value::as_u64).unwrap() as u32
 }
 
 #[test]
@@ -31,7 +40,7 @@ fn point_to_point_round_robins() {
     }
 
     for i in 0..20 {
-        assert!(bus.publish(Envelope::new("work", vec![i]), Some(Duration::from_secs(1))));
+        assert!(bus.publish(env("work", i), Some(Duration::from_secs(1))));
     }
     assert!(bus.shutdown(Duration::from_secs(5)));
     assert_eq!(a.load(Ordering::SeqCst), 10);
@@ -45,20 +54,15 @@ fn pub_sub_fans_out() {
     bus.channel("events", cfg().capacity(100).delivery(Delivery::PubSub));
     for tag in ["a", "b", "c"] {
         let tx = tx.clone();
-        bus.subscribe("events", move |e: &mut Envelope| {
-            tx.send((tag, e.payload[0])).is_ok()
-        });
+        bus.subscribe("events", move |e: &mut Envelope| tx.send((tag, payload_u32(e))).is_ok());
     }
     drop(tx);
 
-    for i in 0..4u8 {
-        bus.publish(
-            Envelope::new("events", vec![i]),
-            Some(Duration::from_secs(1)),
-        );
+    for i in 0..4u32 {
+        bus.publish(env("events", i), Some(Duration::from_secs(1)));
     }
 
-    let mut got: Vec<(&str, u8)> = (0..12)
+    let mut got: Vec<(&str, u32)> = (0..12)
         .map(|_| {
             rx.recv_timeout(Duration::from_secs(5))
                 .expect("fan-out message")
@@ -88,7 +92,7 @@ fn routing_slip_visits_every_stage_in_order() {
 
     let (tx, rx) = channel();
     bus.publish_with_callback(
-        Envelope::new("one", b"x".to_vec()).with_slip(["two", "three"]),
+        make_envelope("one", Some(Value::String("x".into())), ["two".to_string(), "three".to_string()]),
         Some(Duration::from_secs(1)),
         move |_e| {
             let _ = tx.send(());
@@ -125,12 +129,7 @@ fn backpressure_reject_when_full() {
     }
 
     let accepted: usize = (0..10)
-        .map(|i| {
-            bus.publish(
-                Envelope::new("slow", vec![i]),
-                Some(Duration::from_millis(50)),
-            ) as usize
-        })
+        .map(|i| bus.publish(env("slow", i), Some(Duration::from_millis(50))) as usize)
         .sum();
     *gate.lock().unwrap() = true;
     cv.notify_all();
@@ -158,10 +157,7 @@ fn nack_retries_then_dead_letters() {
         });
     }
 
-    bus.publish(
-        Envelope::new("flaky", b"boom".to_vec()),
-        Some(Duration::from_secs(1)),
-    );
+    bus.publish(env("flaky", 0), Some(Duration::from_secs(1)));
     rx.recv_timeout(Duration::from_secs(5))
         .expect("dead-lettered");
     bus.shutdown(Duration::from_secs(5));
@@ -183,11 +179,8 @@ fn shutdown_drains_queued_work() {
             true
         });
     }
-    for i in 0..50u8 {
-        bus.publish(
-            Envelope::new("drain", vec![i]),
-            Some(Duration::from_secs(1)),
-        );
+    for i in 0..50u32 {
+        bus.publish(env("drain", i), Some(Duration::from_secs(1)));
     }
     assert!(bus.shutdown(Duration::from_secs(10)));
     assert_eq!(done.load(Ordering::SeqCst), 50);
@@ -199,24 +192,23 @@ fn publish_after_pause_is_rejected() {
     bus.channel("p", cfg().capacity(10));
     bus.subscribe("p", |_: &mut Envelope| true);
     bus.pause();
-    assert!(!bus.publish(Envelope::new("p", vec![1]), Some(Duration::from_millis(10))));
+    assert!(!bus.publish(env("p", 1), Some(Duration::from_millis(10))));
     bus.resume();
-    assert!(bus.publish(Envelope::new("p", vec![2]), Some(Duration::from_millis(10))));
+    assert!(bus.publish(env("p", 2), Some(Duration::from_millis(10))));
     bus.shutdown(Duration::from_secs(2));
 }
 
 #[test]
 fn unknown_channel_returns_false() {
     let bus = Bus::new(2);
-    assert!(!bus.publish(Envelope::new("nope", vec![1]), None));
+    assert!(!bus.publish(env("nope", 1), None));
     bus.shutdown(Duration::from_secs(2));
 }
 
 struct Counter(Arc<Mutex<Vec<u32>>>);
 impl Consumer for Counter {
-    fn receive(&self, env: &mut Envelope) -> bool {
-        let n = u32::from_le_bytes(env.payload[..4].try_into().unwrap());
-        self.0.lock().unwrap().push(n);
+    fn receive(&self, e: &mut Envelope) -> bool {
+        self.0.lock().unwrap().push(payload_u32(e));
         true
     }
 }
@@ -234,10 +226,7 @@ fn concurrent_producers_deliver_exactly_once() {
         threads.push(std::thread::spawn(move || {
             for i in 0..500u32 {
                 let n = base * 1000 + i;
-                while !bus.publish(
-                    Envelope::new("fan", n.to_le_bytes().to_vec()),
-                    Some(Duration::from_secs(1)),
-                ) {}
+                while !bus.publish(env("fan", n), Some(Duration::from_secs(1))) {}
             }
         }));
     }

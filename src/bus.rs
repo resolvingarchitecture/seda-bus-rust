@@ -117,6 +117,13 @@ struct Channel {
     nacked: AtomicU64,
     dropped: AtomicU64,
     dead_lettered: AtomicU64,
+    // Per-hop delivery attempts, keyed by envelope id (mirrors
+    // channel.attempts in seda-bus-go / Channel._attempts in seda-bus-java):
+    // ra_common::Envelope has no attempts field of its own. Only touched
+    // when max_attempts > 1 - the common single-attempt case never pays for
+    // this lock at all, since the attempt count can't change the outcome
+    // when there's only one attempt.
+    attempts: Mutex<HashMap<String, u32>>,
 }
 
 impl Channel {
@@ -134,7 +141,19 @@ impl Channel {
             nacked: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             dead_lettered: AtomicU64::new(0),
+            attempts: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn bump_attempt(&self, id: &str) -> u32 {
+        let mut a = self.attempts.lock().unwrap();
+        let entry = a.entry(id.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    fn clear_attempt(&self, id: &str) {
+        self.attempts.lock().unwrap().remove(id);
     }
 
     fn depth(&self) -> usize {
@@ -328,16 +347,35 @@ impl Bus {
 
     // -- publishing ------------------------------------------------------
 
-    /// Publish an envelope to the channel named by `env.to`.
-    pub fn publish(&self, env: Envelope, timeout: Option<Duration>) -> bool {
+    /// Publish an envelope to the channel currently at the head of its
+    /// routing slip.
+    ///
+    /// Reads the target via `env.dynamic_routing_slip.current_route()`
+    /// directly (a borrow) rather than `Envelope::route()`/`target_service()`
+    /// (which clone the `Route` - two extra `String` allocations per call,
+    /// for a slip type designed for arbitrary reflective route hierarchies,
+    /// not this bus's simple single-string-per-hop case). This bypass never
+    /// touches `env.route`, which stays consistent for any caller that reads
+    /// it later - `Envelope::route()` lazily populates it from the same
+    /// slip-level cache on first use.
+    pub fn publish(&self, mut env: Envelope, timeout: Option<Duration>) -> bool {
         if !self.0.running.load(Ordering::Acquire) || !self.0.accepting.load(Ordering::Acquire) {
             return false;
         }
-        let ch = match self.0.channels.read().unwrap().get(&env.to) {
-            Some(c) => Arc::clone(c),
-            None => {
-                warn!("no channel {:?}; dropping envelope {}", env.to, env.id);
-                return false;
+        let ch = {
+            let service = match env.dynamic_routing_slip.current_route().and_then(|r| r.service()) {
+                Some(s) => s,
+                None => {
+                    warn!("envelope {} has no route; dropping", env.id);
+                    return false;
+                }
+            };
+            match self.0.channels.read().unwrap().get(service) {
+                Some(c) => Arc::clone(c),
+                None => {
+                    warn!("no channel {:?}; dropping envelope {}", service, env.id);
+                    return false;
+                }
             }
         };
         if !ch.offer(env, timeout) {
@@ -411,7 +449,12 @@ impl Bus {
             return;
         }
 
-        env.attempts += 1;
+        // With a single allowed attempt (the default and this benchmark's
+        // config), the attempt count can never change the outcome - skip the
+        // per-envelope attempts-map lock entirely in that case.
+        let track_attempts = ch.cfg.max_attempts > 1;
+        let attempt = if track_attempts { ch.bump_attempt(&env.id) } else { 1 };
+
         let ok = match ch.cfg.delivery {
             Delivery::PubSub => {
                 let mut all = true;
@@ -429,18 +472,27 @@ impl Bus {
 
         if ok {
             ch.delivered.fetch_add(1, Ordering::Relaxed);
+            if track_attempts {
+                ch.clear_attempt(&env.id);
+            }
             self.complete_hop(env);
-        } else if env.attempts < ch.cfg.max_attempts {
+        } else if attempt < ch.cfg.max_attempts {
             ch.nacked.fetch_add(1, Ordering::Relaxed);
             ch.requeue(env);
         } else {
             ch.nacked.fetch_add(1, Ordering::Relaxed);
+            if track_attempts {
+                ch.clear_attempt(&env.id);
+            }
             self.dead_letter(ch, env);
         }
     }
 
     fn complete_hop(&self, mut env: Envelope) {
-        if env.advance() {
+        // next_route() (a borrow, like current_route() above) advances the
+        // slip's own cache directly; publish()'s current_route() then sees
+        // that same advanced state without popping again.
+        if env.dynamic_routing_slip.next_route().is_some() {
             self.publish(env, Some(Duration::from_secs(5)));
             return;
         }
