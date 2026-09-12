@@ -227,6 +227,23 @@ impl Channel {
                 Backpressure::Block => {
                     let mut guard = self.wait_lock.lock();
                     self.waiters.fetch_add(1, Ordering::AcqRel);
+                    // Close a lost-wakeup window: a slot can free between the
+                    // lock-free depth() check at the top of this loop and
+                    // taking wait_lock/registering as a waiter here. poll()
+                    // only notifies when waiters > 0 at the moment it pops;
+                    // if that pop happened before we incremented waiters, no
+                    // notify was sent and none ever will be for this
+                    // iteration. Re-checking depth() now, still holding
+                    // wait_lock (the same lock poll() takes before its
+                    // notify), catches that case directly - either we see
+                    // the freed slot ourselves and retry immediately, or the
+                    // pop hasn't happened yet and any pop from here on sees
+                    // waiters > 0 and notifies us, since we hold this lock
+                    // continuously through to wait()/wait_for() below.
+                    if self.depth() < self.cfg.capacity {
+                        self.waiters.fetch_sub(1, Ordering::AcqRel);
+                        continue;
+                    }
                     match deadline {
                         None => {
                             self.not_full.wait(&mut guard);

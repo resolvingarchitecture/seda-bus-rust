@@ -240,3 +240,58 @@ fn concurrent_producers_deliver_exactly_once() {
     seen.dedup();
     assert_eq!(seen.len(), 3000);
 }
+
+#[test]
+fn block_backpressure_no_lost_wakeup_under_saturation() {
+    // Deliberately tiny capacity + untimed Block: forces every producer to
+    // wait on almost every publish, hammering the exact race this test
+    // exists to catch - a producer incrementing `waiters` a moment too late
+    // to see a slot a concurrent poll() already freed, with that poll()
+    // having already decided (waiters == 0 at the time) not to notify
+    // anyone. Before the fix, this could - rarely, timing-dependently -
+    // leave a producer parked forever on an untimed wait() with no future
+    // notify coming. Bounded by an explicit deadline below rather than a
+    // bare `.join()`, so a regression hangs this test loudly instead of the
+    // whole suite silently.
+    let bus = Bus::new(4);
+    let seen = Arc::new(Mutex::new(Vec::<u32>::new()));
+    bus.channel(
+        "tight",
+        cfg().capacity(2).concurrency(2).backpressure(Backpressure::Block),
+    );
+    bus.subscribe("tight", Counter(Arc::clone(&seen)));
+
+    let done = Arc::new(AtomicUsize::new(0));
+    let mut threads = Vec::new();
+    for base in 0..6u32 {
+        let bus = bus.clone();
+        let done = Arc::clone(&done);
+        threads.push(std::thread::spawn(move || {
+            for i in 0..300u32 {
+                let n = base * 1000 + i;
+                // Untimed Block - exactly the path the fix closes a race in.
+                assert!(bus.publish(env("tight", n), None));
+            }
+            done.fetch_add(1, Ordering::SeqCst);
+        }));
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while done.load(Ordering::SeqCst) < 6 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        done.load(Ordering::SeqCst),
+        6,
+        "a producer never returned from an untimed Block publish - lost wakeup"
+    );
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert!(bus.shutdown(Duration::from_secs(15)));
+
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 1800);
+}
