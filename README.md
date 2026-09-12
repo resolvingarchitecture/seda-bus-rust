@@ -82,6 +82,27 @@ cargo test
 cargo run --example pipeline
 ```
 
+## Correctness suite coverage
+
+See [`../CORRECTNESS_SUITE.md`](../CORRECTNESS_SUITE.md) for what C1-C7
+mean. All tests live in `tests/bus.rs` unless noted.
+
+| Item | Covered by |
+|---|---|
+| C1 Block | `block_backpressure_no_lost_wakeup_under_saturation` |
+| C1 Reject | `backpressure_reject_when_full` |
+| C1 DropNewest | `drop_newest_behaves_like_reject` |
+| C1 DropOldest | `drop_oldest_evicts_instead_of_rejecting` |
+| C2 succeeds on final attempt, attempt state cleared | `nack_then_succeeds_on_final_attempt_clears_attempt_state` |
+| C2 exhausts attempts, dead-lettered | `nack_retries_then_dead_letters` |
+| C2 no consumers dead-letters immediately | `no_consumers_dead_letters_immediately` |
+| C3 consumer panic isolation | `panicking_consumer_does_not_crash_the_bus` |
+| C4 shutdown accounting (drains in time) | `shutdown_accounts_for_every_envelope_when_it_drains_in_time` |
+| C4 shutdown accounting (timeout first) | `shutdown_accounts_for_every_envelope_even_on_timeout` |
+| C5 config validation | `invalid_channel_config_clamps_to_documented_minimums` (documented behavior: clamp to 1, not panic) |
+| C6 resource lifecycle | `repeated_bus_lifecycles_do_not_leak_threads` |
+| C7 concurrency correctness | `concurrent_producers_deliver_exactly_once` |
+
 ## Status
 
 `0.4.0` &mdash; working core, tested. Not stable until `1.0`.

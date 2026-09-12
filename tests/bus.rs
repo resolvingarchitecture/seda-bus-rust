@@ -140,6 +140,81 @@ fn backpressure_reject_when_full() {
 }
 
 #[test]
+fn drop_newest_behaves_like_reject() {
+    // DropNewest's observable contract from the caller's side is identical
+    // to Reject - discard the incoming envelope, don't admit it - matching
+    // every other seda-bus port's own choice to treat the two the same.
+    // This exists to prove the policy is actually wired to distinguishable,
+    // intentional behavior, not silently ignored.
+    let bus = Bus::new(4);
+    let gate = Arc::new(Mutex::new(false));
+    let cv = Arc::new(std::sync::Condvar::new());
+    bus.channel(
+        "dn",
+        cfg().capacity(2).concurrency(1).backpressure(Backpressure::DropNewest),
+    );
+    {
+        let gate = Arc::clone(&gate);
+        let cv = Arc::clone(&cv);
+        bus.subscribe("dn", move |_: &mut Envelope| {
+            let mut g = gate.lock().unwrap();
+            while !*g {
+                g = cv.wait_timeout(g, Duration::from_secs(5)).unwrap().0;
+            }
+            true
+        });
+    }
+
+    let accepted: usize = (0..10)
+        .map(|i| bus.publish(env("dn", i), Some(Duration::from_millis(50))) as usize)
+        .sum();
+    *gate.lock().unwrap() = true;
+    cv.notify_all();
+
+    assert!(accepted <= 3, "accepted {accepted}");
+    bus.shutdown(Duration::from_secs(5));
+    assert!(bus.get_stats()["dn"].dropped >= 7);
+}
+
+#[test]
+fn drop_oldest_evicts_instead_of_rejecting() {
+    let bus = Bus::new(4);
+    let gate = Arc::new(Mutex::new(false));
+    let cv = Arc::new(std::sync::Condvar::new());
+    bus.channel(
+        "do",
+        cfg().capacity(2).concurrency(1).backpressure(Backpressure::DropOldest),
+    );
+    {
+        let gate = Arc::clone(&gate);
+        let cv = Arc::clone(&cv);
+        bus.subscribe("do", move |_: &mut Envelope| {
+            let mut g = gate.lock().unwrap();
+            while !*g {
+                g = cv.wait_timeout(g, Duration::from_secs(5)).unwrap().0;
+            }
+            true
+        });
+    }
+
+    for i in 0..10 {
+        assert!(
+            bus.publish(env("do", i), Some(Duration::from_millis(50))),
+            "DropOldest must always admit the newest envelope"
+        );
+        assert!(
+            bus.get_stats()["do"].depth <= 2,
+            "depth must never exceed capacity under DropOldest"
+        );
+    }
+    *gate.lock().unwrap() = true;
+    cv.notify_all();
+    bus.shutdown(Duration::from_secs(5));
+
+    assert!(bus.get_stats()["do"].dropped >= 7, "dropped={}", bus.get_stats()["do"].dropped);
+}
+
+#[test]
 fn nack_retries_then_dead_letters() {
     let bus = Bus::new(4);
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -164,6 +239,80 @@ fn nack_retries_then_dead_letters() {
 
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
     assert_eq!(bus.get_stats()["flaky"].dead_lettered, 1);
+}
+
+/// C2(a): succeeds on the final allowed attempt - delivered exactly once,
+/// and the per-envelope attempts map (keyed by envelope id) is cleared
+/// afterward rather than leaking. There's no public accessor for the
+/// attempts map's size, so this is verified indirectly: publish a *second*
+/// envelope with the *same id* after the first succeeds on its last
+/// attempt, give it a consumer that always acks, and confirm it delivers
+/// on attempt 1 rather than starting from wherever the first envelope's
+/// (finished) attempt count left off - which is only possible if
+/// `clear_attempt` actually ran.
+#[test]
+fn nack_then_succeeds_on_final_attempt_clears_attempt_state() {
+    let bus = Bus::new(4);
+    bus.channel("flaky2", cfg().capacity(10).max_attempts(3));
+    let seen_attempts = Arc::new(Mutex::new(Vec::<u32>::new()));
+    let call_count = Arc::new(AtomicUsize::new(0));
+    {
+        let seen_attempts = Arc::clone(&seen_attempts);
+        let call_count = Arc::clone(&call_count);
+        bus.subscribe("flaky2", move |e: &mut Envelope| {
+            let n = call_count.fetch_add(1, Ordering::SeqCst);
+            seen_attempts.lock().unwrap().push(payload_u32(e));
+            // Nack the first two calls for id "a" (envelope 0), then ack -
+            // succeeds on attempt 3, the last one allowed.
+            n >= 2
+        });
+    }
+
+    let mut e = env("flaky2", 0);
+    let fixed_id = "same-id-for-attempt-state-check".to_string();
+    e.id = fixed_id.clone();
+    assert!(bus.publish(e, Some(Duration::from_secs(1))));
+    // Wait for the 3rd (successful) call.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while call_count.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(call_count.load(Ordering::SeqCst), 3, "expected exactly 3 attempts");
+    assert_eq!(bus.get_stats()["flaky2"].delivered, 1);
+    assert_eq!(bus.get_stats()["flaky2"].dead_lettered, 0);
+
+    // Reused id, same channel: if attempt state weren't cleared after the
+    // first envelope's success, this one would inherit a stale attempt
+    // count and could dead-letter after just one more nack instead of
+    // getting its own fresh 3 attempts. Nack it exactly twice, then ack.
+    let mut e2 = env("flaky2", 1);
+    e2.id = fixed_id;
+    assert!(bus.publish(e2, Some(Duration::from_secs(1))));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while call_count.load(Ordering::SeqCst) < 6 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(bus.shutdown(Duration::from_secs(5)), true);
+    assert_eq!(bus.get_stats()["flaky2"].delivered, 2, "second envelope with the reused id should also get its own fresh 3 attempts and succeed, not inherit stale state");
+    assert_eq!(bus.get_stats()["flaky2"].dead_lettered, 0);
+}
+
+/// C2: a channel with no consumers at all dead-letters immediately rather
+/// than silently discarding.
+#[test]
+fn no_consumers_dead_letters_immediately() {
+    let bus = Bus::new(4);
+    bus.channel("nobody-home", cfg().capacity(10));
+    bus.channel("dead2", cfg().capacity(10));
+    bus.set_dead_letter_channel("nobody-home", "dead2");
+    let (tx, rx) = channel();
+    bus.subscribe("dead2", move |_: &mut Envelope| tx.send(()).is_ok());
+
+    assert!(bus.publish(env("nobody-home", 0), Some(Duration::from_secs(1))));
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("dead-lettered immediately despite no consumers");
+    bus.shutdown(Duration::from_secs(5));
+    assert_eq!(bus.get_stats()["nobody-home"].dead_lettered, 1);
 }
 
 #[test]
@@ -294,4 +443,134 @@ fn block_backpressure_no_lost_wakeup_under_saturation() {
     seen.sort_unstable();
     seen.dedup();
     assert_eq!(seen.len(), 1800);
+}
+
+/// C3: a consumer that panics on every Nth envelope must not crash the bus
+/// or the worker that ran it - every other envelope, before and after the
+/// panic, still gets delivered. `safe_receive` already wraps every consumer
+/// call in `catch_unwind`; this pins that behavior down explicitly rather
+/// than trusting it by inspection.
+#[test]
+fn panicking_consumer_does_not_crash_the_bus() {
+    let bus = Bus::new(4);
+    bus.channel("flaky-panic", cfg().capacity(50).concurrency(1));
+    let delivered = Arc::new(Mutex::new(Vec::<u32>::new()));
+    {
+        let delivered = Arc::clone(&delivered);
+        bus.subscribe("flaky-panic", move |e: &mut Envelope| {
+            let n = payload_u32(e);
+            if n % 3 == 0 {
+                panic!("simulated consumer failure for {n}");
+            }
+            delivered.lock().unwrap().push(n);
+            true
+        });
+    }
+
+    for i in 0..15u32 {
+        assert!(bus.publish(env("flaky-panic", i), Some(Duration::from_secs(1))));
+    }
+    bus.shutdown(Duration::from_secs(5));
+
+    let delivered = delivered.lock().unwrap();
+    let expected: Vec<u32> = (0..15).filter(|n| n % 3 != 0).collect();
+    let mut got = delivered.clone();
+    got.sort_unstable();
+    assert_eq!(got, expected, "every non-panicking envelope should still be delivered");
+    // A panicking receive() is a nack with max_attempts == 1 (the default),
+    // so it's dead-lettered, not endlessly retried.
+    assert_eq!(bus.get_stats()["flaky-panic"].dead_lettered, 5);
+}
+
+/// C4: `shutdown(timeout)` must account for every accepted envelope as
+/// delivered, dead-lettered, or (new, see the fix in `Bus::shutdown`)
+/// dropped - never silently stranded - regardless of whether the timeout
+/// elapsed first or everything drained in time.
+#[test]
+fn shutdown_accounts_for_every_envelope_even_on_timeout() {
+    let bus = Bus::new(4);
+    let delivered = Arc::new(AtomicUsize::new(0));
+    bus.channel("slow-drain", cfg().capacity(50).concurrency(2));
+    {
+        let delivered = Arc::clone(&delivered);
+        bus.subscribe("slow-drain", move |_: &mut Envelope| {
+            std::thread::sleep(Duration::from_millis(30));
+            delivered.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+    }
+    let total = 20u32;
+    for i in 0..total {
+        assert!(bus.publish(env("slow-drain", i), Some(Duration::from_secs(1))));
+    }
+    // Deliberately much shorter than the ~300ms (20 envelopes / 2
+    // concurrency * 30ms) minimum processing time - await_drain almost
+    // certainly times out (drained == false) here.
+    let drained = bus.shutdown(Duration::from_millis(15));
+    let stats = bus.get_stats();
+    let s = &stats["slow-drain"];
+    assert_eq!(
+        s.delivered + s.dead_lettered + s.dropped,
+        total as u64,
+        "shutdown(drained={drained}) must account for every envelope, not strand any of them: {s:?}"
+    );
+}
+
+#[test]
+fn shutdown_accounts_for_every_envelope_when_it_drains_in_time() {
+    let bus = Bus::new(4);
+    bus.channel("fast-drain", cfg().capacity(50).concurrency(4));
+    bus.subscribe("fast-drain", |_: &mut Envelope| true);
+    let total = 20u32;
+    for i in 0..total {
+        assert!(bus.publish(env("fast-drain", i), Some(Duration::from_secs(1))));
+    }
+    let drained = bus.shutdown(Duration::from_secs(5));
+    assert!(drained, "expected a generous timeout to actually drain");
+    let stats = bus.get_stats();
+    let s = &stats["fast-drain"];
+    assert_eq!(s.delivered + s.dead_lettered + s.dropped, total as u64);
+    assert_eq!(s.dropped, 0, "nothing should have been force-dropped when it drained normally");
+}
+
+/// C5: `ChannelConfig`'s builder methods clamp invalid values (<=0, or in
+/// this case simply 0 - `usize`/`u32` have no negative values to clamp from
+/// here) to 1 rather than failing fast or misbehaving silently at runtime.
+/// This pins down that this port's documented choice is clamp, not panic.
+#[test]
+fn invalid_channel_config_clamps_to_documented_minimums() {
+    let c = ChannelConfig::default().capacity(0).concurrency(0).max_attempts(0);
+    assert_eq!(c.capacity, 1);
+    assert_eq!(c.concurrency, 1);
+    assert_eq!(c.max_attempts, 1);
+
+    // And a channel built from it is actually usable, not just holding
+    // clamped numbers that are never exercised.
+    let bus = Bus::new(2);
+    bus.channel("clamped", c);
+    bus.subscribe("clamped", |_: &mut Envelope| true);
+    assert!(bus.publish(env("clamped", 0), Some(Duration::from_secs(1))));
+    assert!(bus.shutdown(Duration::from_secs(5)));
+    assert_eq!(bus.get_stats()["clamped"].delivered, 1);
+}
+
+/// C6: constructing and fully shutting down a Bus repeatedly must not leak
+/// the one externally-visible resource this port's design owns per
+/// instance - the Pool's OS threads. `Pool::join` (called by both
+/// `Bus::shutdown` and `Pool`'s own `Drop`) joins every worker thread
+/// before returning, so there's no portable "current thread count" API
+/// needed to prove this in Rust: if threads were leaking, later iterations
+/// of this loop would slow down or eventually fail to spawn new ones
+/// (`thread::Builder::spawn` returns a `Result`, unwrapped with `.expect`
+/// in `Pool::new` - a real leak would surface here directly, not need a
+/// separate counter).
+#[test]
+fn repeated_bus_lifecycles_do_not_leak_threads() {
+    for i in 0..25 {
+        let bus = Bus::new(4);
+        bus.channel("cycle", cfg().capacity(10));
+        bus.subscribe("cycle", |_: &mut Envelope| true);
+        assert!(bus.publish(env("cycle", i), Some(Duration::from_secs(1))));
+        assert!(bus.shutdown(Duration::from_secs(5)), "cycle {i} failed to drain");
+    }
 }

@@ -617,6 +617,38 @@ impl Bus {
         let drained = self.await_drain(timeout);
         self.0.running.store(false, Ordering::Release);
         self.0.pool.join();
+        if !drained {
+            // Found by the correctness suite (C4): await_drain gave up
+            // before every channel was empty. Once running is false and
+            // the pool is joined, nothing will ever schedule another drain
+            // for these channels - drain()'s own reschedule is gated on
+            // `running`, and any drain job already queued in the pool sees
+            // `running` false on its very first loop check and returns
+            // without popping anything. Without this sweep, whatever was
+            // still sitting in a channel's queue at that moment is
+            // silently stranded forever: still counted in depth(), never
+            // delivered, never dead-lettered, and permanently unreachable
+            // (repro: 20 envelopes at 50ms each, concurrency 1, a 10ms
+            // shutdown timeout left 19 of them stuck with delivered=1,
+            // dead_lettered=0, dropped=0 - no accounting of any kind).
+            //
+            // Draining here, on the calling thread, instead accounts for
+            // every leftover envelope as `dropped` - an explicit, counted
+            // outcome instead of silent loss - so the invariant "every
+            // accepted envelope ends up delivered, dead-lettered, or
+            // dropped" holds even when the timeout is too short to finish
+            // gracefully. Safe to race against any still-finishing drain
+            // task: `Channel::poll`'s underlying `ArrayQueue::pop` is
+            // atomic per item, so each envelope is claimed by exactly one
+            // side either way, never both.
+            let channels: Vec<Arc<Channel>> =
+                self.0.channels.read().unwrap().values().cloned().collect();
+            for ch in channels {
+                while ch.poll().is_some() {
+                    ch.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         drained
     }
 
