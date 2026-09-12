@@ -1,11 +1,16 @@
 //! The bus: a registry of stages drained by one shared worker pool.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crossbeam_queue::ArrayQueue;
 use log::warn;
+// Only for Channel's rare block-wait path (see its own comment) - std's
+// Condvar/Mutex park immediately with no spin phase, which is exactly the
+// cold-wake cost this crate's Pool moved off of already (see pool.rs).
+use parking_lot::{Condvar as PlCondvar, Mutex as PlMutex};
 
 use crate::envelope::Envelope;
 use crate::pool::Pool;
@@ -107,8 +112,35 @@ pub struct Stats {
 struct Channel {
     name: String,
     cfg: ChannelConfig,
-    queue: Mutex<VecDeque<Envelope>>,
-    not_full: Condvar,
+    // Lock-free bounded MPMC ring buffer, not `Mutex<VecDeque<Envelope>>` -
+    // the mutex-guarded queue made every producer and every consumer on a
+    // stage contend on the same lock regardless of which end they touched,
+    // measured as `par`'s worst-in-report tail latency (`p50` ~40us,
+    // `p99` ~70ms - see seda-bus-compare/RESULTS.md). seda-bus-cpp had the
+    // identical pattern and fixed it with a two-lock queue; `ArrayQueue`
+    // goes further (no locks on the hot path at all) without hand-rolled
+    // unsafe code in this crate - it's from `crossbeam-queue`, a
+    // different crate and a different data structure from
+    // `crossbeam-channel` (tried and reverted for the *pool's* job queue
+    // in an earlier pass over `par` throughput; verify this doesn't
+    // reproduce that before trusting it, don't assume from the name).
+    // Sized `capacity + requeue_headroom` so `requeue` (nack retry) never
+    // needs its own capacity check - see `requeue`'s own comment.
+    queue: ArrayQueue<Envelope>,
+    // parking_lot, not std::sync - `poll()` touches this on every single
+    // successful pop (to notify a possibly-blocked producer), so its cost
+    // sits on the hot path even though `wait()` itself is rare. std's
+    // Condvar/Mutex park immediately with no spin phase; a first version
+    // of this fix used std's and regressed `seq`'s `p50` ~14x (1.1ms ->
+    // 15.2ms, Docker-verified) even though `seq` has no producer/consumer
+    // contention to speak of - the cost was in touching the lock at all,
+    // not contention on it. `waiters` additionally lets `poll()` skip
+    // touching this entirely when nothing is waiting (the common case:
+    // this benchmark's capacity is never exhausted), mirroring the same
+    // fix applied to seda-bus-cs's attempt.
+    not_full: PlCondvar,
+    wait_lock: PlMutex<()>,
+    waiters: AtomicUsize,
     consumers: RwLock<Vec<Arc<dyn Consumer>>>,
     rr: AtomicUsize,
     permits: AtomicUsize,
@@ -128,11 +160,19 @@ struct Channel {
 
 impl Channel {
     fn new(name: String, cfg: ChannelConfig) -> Channel {
+        // See `requeue`'s comment for why max_attempts > 1 needs headroom
+        // beyond `capacity`: at most `concurrency` envelopes can be
+        // popped-but-not-yet-acked (in flight) at once, so that's the
+        // most that could all be requeued "at the same time" without any
+        // of it representing real, unbounded growth.
+        let requeue_headroom = if cfg.max_attempts > 1 { cfg.concurrency } else { 0 };
         Channel {
             name,
             cfg,
-            queue: Mutex::new(VecDeque::new()),
-            not_full: Condvar::new(),
+            queue: ArrayQueue::new((cfg.capacity + requeue_headroom).max(1)),
+            not_full: PlCondvar::new(),
+            wait_lock: PlMutex::new(()),
+            waiters: AtomicUsize::new(0),
             consumers: RwLock::new(Vec::new()),
             rr: AtomicUsize::new(0),
             permits: AtomicUsize::new(cfg.concurrency),
@@ -157,57 +197,82 @@ impl Channel {
     }
 
     fn depth(&self) -> usize {
-        self.queue.lock().unwrap().len()
+        self.queue.len()
     }
 
     fn offer(&self, env: Envelope, timeout: Option<Duration>) -> bool {
         let deadline = timeout.map(|d| Instant::now() + d);
-        let mut q = self.queue.lock().unwrap();
-        while q.len() >= self.cfg.capacity {
+        let mut env = env;
+        loop {
+            if self.depth() < self.cfg.capacity {
+                match self.queue.push(env) {
+                    Ok(()) => {
+                        self.enqueued.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
+                    Err(rejected) => env = rejected, // lost a race for the last slot - fall through and retry
+                }
+            }
             match self.cfg.backpressure {
                 Backpressure::Reject | Backpressure::DropNewest => {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
                 Backpressure::DropOldest => {
-                    q.pop_front();
-                    self.dropped.fetch_add(1, Ordering::Relaxed);
-                    break;
+                    if self.queue.pop().is_some() {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // loop back and retry the push
                 }
-                Backpressure::Block => match deadline {
-                    None => q = self.not_full.wait(q).unwrap(),
-                    Some(dl) => {
-                        let now = Instant::now();
-                        if now >= dl {
-                            self.dropped.fetch_add(1, Ordering::Relaxed);
-                            return false;
+                Backpressure::Block => {
+                    let mut guard = self.wait_lock.lock();
+                    self.waiters.fetch_add(1, Ordering::AcqRel);
+                    match deadline {
+                        None => {
+                            self.not_full.wait(&mut guard);
                         }
-                        let (g, res) = self.not_full.wait_timeout(q, dl - now).unwrap();
-                        q = g;
-                        if res.timed_out() && q.len() >= self.cfg.capacity {
-                            self.dropped.fetch_add(1, Ordering::Relaxed);
-                            return false;
+                        Some(dl) => {
+                            let now = Instant::now();
+                            if now >= dl {
+                                self.waiters.fetch_sub(1, Ordering::AcqRel);
+                                self.dropped.fetch_add(1, Ordering::Relaxed);
+                                return false;
+                            }
+                            self.not_full.wait_for(&mut guard, dl - now);
                         }
                     }
-                },
+                    self.waiters.fetch_sub(1, Ordering::AcqRel);
+                    // loop back and retry the push; a spurious/timed-out
+                    // wake just re-checks depth() next iteration
+                }
             }
         }
-        q.push_back(env);
-        self.enqueued.fetch_add(1, Ordering::Relaxed);
-        true
     }
 
     fn poll(&self) -> Option<Envelope> {
-        let mut q = self.queue.lock().unwrap();
-        let env = q.pop_front();
-        if env.is_some() {
+        let env = self.queue.pop();
+        if env.is_some() && self.waiters.load(Ordering::Acquire) > 0 {
+            let _guard = self.wait_lock.lock();
             self.not_full.notify_one();
         }
         env
     }
 
+    // No capacity check, by design - matches every other port's Requeue
+    // (nack retry must never be dropped by the policy governing fresh
+    // admission). Correct rather than merely convenient: the queue is
+    // sized with `requeue_headroom` slack (see `new`) specifically so
+    // this can never legitimately fail; the retry loop below is a safety
+    // net against the CAS race in `ArrayQueue::push`, not a real capacity
+    // wait.
     fn requeue(&self, env: Envelope) {
-        self.queue.lock().unwrap().push_front(env);
+        let mut env = env;
+        loop {
+            match self.queue.push(env) {
+                Ok(()) => return,
+                Err(rejected) => env = rejected,
+            }
+        }
     }
 
     fn try_acquire(&self) -> bool {

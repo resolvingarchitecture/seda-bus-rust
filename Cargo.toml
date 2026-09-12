@@ -13,6 +13,7 @@ keywords = ["seda", "message-bus", "staged", "concurrency"]
 categories = ["concurrency"]
 
 [dependencies]
+crossbeam-queue = "0.3"
 log = "0.4"
 parking_lot = "0.12"
 ra-common = { path = "../../common/ra-common-rust" }
