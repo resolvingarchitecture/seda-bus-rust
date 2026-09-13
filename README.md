@@ -84,7 +84,7 @@ cargo run --example pipeline
 
 ## Correctness suite coverage
 
-See [`../CORRECTNESS_SUITE.md`](../CORRECTNESS_SUITE.md) for what C1-C7
+See [`../seda-bus-design/CORRECTNESS_SUITE.md`](../seda-bus-design/CORRECTNESS_SUITE.md) for what C1-C7
 mean. All tests live in `tests/bus.rs` unless noted.
 
 | Item | Covered by |
