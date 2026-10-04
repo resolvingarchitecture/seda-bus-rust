@@ -1,11 +1,11 @@
 [package]
 name = "seda_bus"
 version = "0.4.0"
-authors = ["Brian Taylor <brian@resolvingarchitecture.io>"]
+authors = ["Brian Taylor <brian@resolvingarchitecture.dev>"]
 license = "MIT"
 edition = "2021"
 description = "A small, broker-less, staged (SEDA-style) message bus"
-homepage = "https://resolvingarchitecture.io"
+homepage = "https://resolvingarchitecture.dev"
 documentation = "https://docs.rs/seda_bus"
 repository = "https://github.com/resolvingarchitecture/seda-bus"
 readme = "README.md"
